@@ -777,6 +777,9 @@ func prove(f *Func) {
 
 	var lensVars map[*Block][]*Value
 
+	if f.pass.debug > 10 {
+		fmt.Println(f)
+	}
 	// Find length and capacity ops.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
@@ -873,11 +876,12 @@ func prove(f *Func) {
 		work = work[:len(work)-1]
 		parent := idom[node.block.ID]
 		branch := getBranch(sdom, parent, node.block)
-
+		if f.pass.debug > 10 {
+			fmt.Println(node.block.ID)
+		}
 		switch node.state {
 		case descend:
 			ft.checkpoint()
-
 			// Entering the block, add the block-depending facts that we collected
 			// at the beginning: induction variables and lens/caps of slices.
 			if iv, ok := indVars[node.block]; ok {
@@ -896,6 +900,9 @@ func prove(f *Func) {
 
 			if branch != unknown {
 				addBranchRestrictions(ft, parent, branch)
+				// if f.pass.debug > 10 {
+				addBranchingFacts(ft, node.block, false)
+				// }
 				if ft.unsat {
 					// node.block is unreachable.
 					// Remove it and don't visit
@@ -930,8 +937,71 @@ func prove(f *Func) {
 	}
 
 	ft.restore()
+	if f.pass.debug > 10 {
+		fmt.Println(f)
+	}
 
 	ft.cleanup(f)
+}
+
+// add facts that relate to the resulting branch
+// direct only adds facts that are directly related, so only go one deep).
+func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
+	// Doesnt handle any other block kinds
+	if b.ID == 3 && b.Kind == BlockIf {
+		tmpValues := b.ControlValues()
+		var values = make([]*Value, len(tmpValues), len(tmpValues))
+
+		for i, v := range tmpValues {
+			values[i] = v
+		}
+
+		for len(values) != 0 {
+			value := values[len(values)-1]
+			values = values[:len(values)-1]
+
+			switch value.Op {
+			case OpLeq32:
+				// If we compare against a constant
+				// Currently only 0 is considered
+				if len(value.Args) != 0 && value.Args[0].Op == OpConst32 && value.Args[0].AuxInt == 0 {
+					values = append(values, value.Args[1])
+				}
+			case OpNeg32:
+				var zix uint32
+				var ok bool
+				if zix, ok = ft.orderS.constants[0]; !ok {
+					continue
+				}
+				order := ft.orderS
+				vix, found := order.lookup(value.Args[0])
+				if !found {
+					continue
+				}
+				//TODO: It would be nice if there was a reaches that returned the strictness so we could adjust as well
+				if order.reaches(zix, vix, false) {
+					var zeroValue *Value
+					//TODO: This should be done cleaner
+					for zid, ix := range order.values {
+						if ix == zix {
+							zeroValue = &Value{ID: zid}
+						}
+					}
+					order.SetOrderOrEqual(value, zeroValue)
+				}
+				if order.reaches(vix, zix, false) {
+					var zeroValue *Value
+					//TODO: This should be done cleaner
+					for zid, ix := range order.values {
+						if ix == zix {
+							zeroValue = &Value{ID: zid}
+						}
+					}
+					order.SetOrderOrEqual(zeroValue, value)
+				}
+			}
+		}
+	}
 }
 
 // getBranch returns the range restrictions added by p
