@@ -989,7 +989,7 @@ var rules []rule = []rule{
 			rulevalue{
 				ID:         0,
 				Op:         _opLeq,
-				args:       []int{-1, -1},
+				args:       []int{5, 1},
 				followpath: []bool{true, true},
 			},
 			rulevalue{
@@ -1037,14 +1037,23 @@ type ruleset struct {
 	m              map[*Value]int
 	m2             map[int]*Value
 	relationProven bool
+	visited        int
 }
 
-func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value, args []*Value) ([]ruleset, []ruleset) {
+func matchRule(searchspace []ruleset, opkind genericOp, value *Value, args []*Value, first bool) ([]ruleset, []ruleset) {
 	//TODO: Is allocating to expensive?
 	out := make([]ruleset, 0, len(searchspace))
 	found := make([]ruleset, 0)
 	for _, v := range searchspace {
 		r := v.r
+		var index int
+		if first {
+			index = 0
+		} else if vid, ok := v.m[value]; ok {
+			index = vid
+		} else {
+			return nil, nil
+		}
 		if r.series[index].Op == opkind {
 			// make sure that the knowlege about the assigned value adds up
 			if id, ok := v.m[value]; ok {
@@ -1080,7 +1089,9 @@ func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value,
 					v.m2[rvid] = args[i]
 				}
 			}
-			if len(r.series)-1 == index {
+			v.visited++
+
+			if len(r.series) == v.visited {
 				found = append(found, v)
 			} else {
 				out = append(out, v)
@@ -1098,49 +1109,18 @@ func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value,
 						vcopy.m2[rvid] = args[1-i]
 					}
 				}
+				vcopy.visited++
 
-				if len(r.series)-1 == index {
+				if len(r.series) == v.visited {
 					found = append(found, vcopy)
 				} else {
 					out = append(out, vcopy)
 				}
-
 			}
 		}
 	}
 	return out, found
 }
-
-// func matchRuleFact(searchspace []ruleset, i1, i2 *Value) []ruleset {
-// 	//TODO: Is allocating to expensive?
-// 	out := make([]ruleset, 0, len(searchspace))
-// 	for i, v := range searchspace {
-// 		r := v.r
-// 		var matches1 bool
-// 		var matches2 bool
-// 		switch i1.Op {
-// 		case OpConst8, OpConst16, OpConst32, OpConst64:
-// 			if r.series[r.fact.v1-1].Op == _opConst || r.series[r.fact.v1-1].Op == _opAny {
-// 				matches1 = true
-// 			} else if r.series[r.fact.v2-1].Op == _opConst || r.series[r.fact.v2-1].Op == _opAny {
-// 				matches2 = true
-// 			} else {
-// 				continue
-// 			}
-// 		}
-// 		switch i2.Op {
-// 		case OpConst8, OpConst16, OpConst32, OpConst64:
-// 			if !matches1 && (r.series[r.fact.v1-1].Op == _opConst || r.series[r.fact.v1-1].Op == _opAny) {
-// 				searchspace[i].found = true
-// 			} else if !matches2 && (r.series[r.fact.v2-1].Op == _opConst || r.series[r.fact.v2-1].Op == _opAny) {
-// 				out = append(out, v)
-// 			} else {
-// 				continue
-// 			}
-// 		}
-// 	}
-// 	return out
-// }
 
 // add facts that relate to the resulting branch
 // direct only adds facts that are directly related, so only go one deep).
@@ -1170,26 +1150,26 @@ func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 
 			switch value.Op {
 			case OpLeq8, OpLeq16, OpLeq32, OpLeq64:
-				matches, found = matchRule(matches, _opLeq, index, value, value.Args)
+				matches, found = matchRule(matches, _opLeq, value, value.Args, true)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpLess8, OpLess16, OpLess32, OpLess64:
-				matches, found = matchRule(matches, _opLe, index, value, value.Args)
+				matches, found = matchRule(matches, _opLe, value, value.Args, false)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
-				matches, found = matchRule(matches, _opNeg, index, value, value.Args)
+				matches, found = matchRule(matches, _opNeg, value, value.Args, false)
 				index++
 				values = append(values, value.Args[0])
 			case OpAdd8, OpAdd16, OpAdd32, OpAdd64:
-				matches, found = matchRule(matches, _opAdd, index, value, value.Args)
+				matches, found = matchRule(matches, _opAdd, value, value.Args, false)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpConst8, OpConst16, OpConst32, OpConst64:
-				matches, found = matchRule(matches, _opConst, index, value, value.Args)
+				matches, found = matchRule(matches, _opConst, value, value.Args, false)
 				index++
 			default:
-				matches, found = matchRule(matches, _opAny, index, value, value.Args)
+				matches, found = matchRule(matches, _opAny, value, value.Args, false)
 				index++
 				// case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
 				// 	matches, found = matchRule(matches, _opNeg, index, value, value.Args)
