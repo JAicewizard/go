@@ -5,8 +5,6 @@
 package test
 
 import "testing"
-import "math"
-import "fmt"
 
 // var globl int64
 // var globl32 int32
@@ -131,7 +129,6 @@ var glob_1 = -1
 func addloop(b *testing.B) int {
 	out := 0
 	for i := 0; i < b.N; i++ {
-		fmt.Println(glob_1, math.MinInt)
 		if glob_1 < 0 {
 			glob_1 += 1
 			out += 1 << -glob_1

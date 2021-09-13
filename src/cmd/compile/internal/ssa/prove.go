@@ -950,6 +950,7 @@ const (
 	_opNeg
 	_opLeq
 	_opLe
+	_opAdd
 )
 
 type rulevalue struct {
@@ -980,6 +981,7 @@ type rule struct {
 	assumeSame bool
 }
 
+var _true = true
 var rules []rule = []rule{
 	//TODO: This rule could be more strict, negating the const somehow
 	rule{
@@ -997,22 +999,33 @@ var rules []rule = []rule{
 				followpath: []bool{true},
 			},
 			rulevalue{
-				ID: 2,
-				Op: _opAny,
+				ID:         2,
+				Op:         _opAdd,
+				args:       []int{4, 3},
+				followpath: []bool{true, true},
 			},
+			//TODO: This rule relies on knowing that the constant is non-0
 			rulevalue{
 				ID: 3,
 				Op: _opConst,
 			},
+			rulevalue{
+				ID: 4,
+				Op: _opAny,
+			},
+			rulevalue{
+				ID: 5,
+				Op: _opConst,
+			},
 		},
 		fact: rulerelation{
-			v1:     3,
-			v2:     2,
-			strict: nil,
+			v1:     5,
+			v2:     4,
+			strict: &_true,
 		},
 		conclusion: rulerelation{
 			v1:     1,
-			v2:     3,
+			v2:     5,
 			strict: nil,
 		},
 		assumeSame: false,
@@ -1042,6 +1055,20 @@ func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value,
 				v.m[value] = index
 				v.m2[index] = value
 			}
+
+			// duplicate in case symmetric operations
+			var vcopy ruleset
+			switch opkind {
+			case _opAdd:
+				vcopy = v
+				vcopy.m = make(map[*Value]int, len(v.m))
+				vcopy.m2 = make(map[int]*Value, len(v.m2))
+				for v, id := range v.m {
+					vcopy.m[v] = id
+					vcopy.m2[id] = v
+				}
+			}
+
 			// make sure that the knowlege about the arguments adds up
 			for i, rvid := range r.series[index].args {
 				if id, ok := v.m[args[i]]; ok {
@@ -1057,6 +1084,27 @@ func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value,
 				found = append(found, v)
 			} else {
 				out = append(out, v)
+			}
+			switch opkind {
+			case _opAdd:
+				// make sure that the knowlege about the arguments adds up
+				for i, rvid := range r.series[index].args {
+					if id, ok := vcopy.m[args[1-i]]; ok {
+						if id != rvid {
+							continue
+						}
+					} else if rvid != -1 {
+						vcopy.m[args[1-i]] = rvid
+						vcopy.m2[rvid] = args[1-i]
+					}
+				}
+
+				if len(r.series)-1 == index {
+					found = append(found, vcopy)
+				} else {
+					out = append(out, vcopy)
+				}
+
 			}
 		}
 	}
@@ -1125,10 +1173,18 @@ func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 				matches, found = matchRule(matches, _opLeq, index, value, value.Args)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
+			case OpLess8, OpLess16, OpLess32, OpLess64:
+				matches, found = matchRule(matches, _opLe, index, value, value.Args)
+				index++
+				values = append(values, value.Args[0], value.Args[1])
 			case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
 				matches, found = matchRule(matches, _opNeg, index, value, value.Args)
 				index++
 				values = append(values, value.Args[0])
+			case OpAdd8, OpAdd16, OpAdd32, OpAdd64:
+				matches, found = matchRule(matches, _opAdd, index, value, value.Args)
+				index++
+				values = append(values, value.Args[0], value.Args[1])
 			case OpConst8, OpConst16, OpConst32, OpConst64:
 				matches, found = matchRule(matches, _opConst, index, value, value.Args)
 				index++
