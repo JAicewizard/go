@@ -900,9 +900,7 @@ func prove(f *Func) {
 
 			if branch != unknown {
 				addBranchRestrictions(ft, parent, branch)
-				// if f.pass.debug > 10 {
 				addBranchingFacts(ft, node.block, false)
-				// }
 				if ft.unsat {
 					// node.block is unreachable.
 					// Remove it and don't visit
@@ -944,62 +942,277 @@ func prove(f *Func) {
 	ft.cleanup(f)
 }
 
+type genericOp int
+
+const (
+	_opAny = iota
+	_opConst
+	_opNeg
+	_opLeq
+	_opLe
+)
+
+type rulevalue struct {
+	ID         int
+	Op         genericOp
+	args       []int
+	followpath []bool
+}
+
+// A relation between 2 values in the rule.
+// Strictness is defined by the strict field. If the strict
+// field is nil, strictness should be figured out.
+type rulerelation struct {
+	v1     int
+	v2     int
+	strict *bool
+}
+
+type rule struct {
+	//The series is in order. Every values ID should be its index
+	series []rulevalue
+	fact   rulerelation
+	// if strict is nil, it is inverted of what the strictness of
+	// the relations are if assumeSame is true, and the same if
+	// asumeSame is false.
+	// These 2 values have the same relation as the fact field
+	conclusion rulerelation
+	assumeSame bool
+}
+
+var rules []rule = []rule{
+	//TODO: This rule could be more strict, negating the const somehow
+	rule{
+		series: []rulevalue{
+			rulevalue{
+				ID:         0,
+				Op:         _opLeq,
+				args:       []int{-1, -1},
+				followpath: []bool{true, true},
+			},
+			rulevalue{
+				ID:         1,
+				Op:         _opNeg,
+				args:       []int{2},
+				followpath: []bool{true},
+			},
+			rulevalue{
+				ID: 2,
+				Op: _opAny,
+			},
+			rulevalue{
+				ID: 3,
+				Op: _opConst,
+			},
+		},
+		fact: rulerelation{
+			v1:     3,
+			v2:     2,
+			strict: nil,
+		},
+		conclusion: rulerelation{
+			v1:     1,
+			v2:     3,
+			strict: nil,
+		},
+		assumeSame: false,
+	},
+}
+
+type ruleset struct {
+	r              rule
+	m              map[*Value]int
+	m2             map[int]*Value
+	relationProven bool
+}
+
+func matchRule(searchspace []ruleset, opkind genericOp, index int, value *Value, args []*Value) ([]ruleset, []ruleset) {
+	//TODO: Is allocating to expensive?
+	out := make([]ruleset, 0, len(searchspace))
+	found := make([]ruleset, 0)
+	for _, v := range searchspace {
+		r := v.r
+		if r.series[index].Op == opkind {
+			// make sure that the knowlege about the assigned value adds up
+			if id, ok := v.m[value]; ok {
+				if id != index {
+					continue
+				}
+			} else {
+				v.m[value] = index
+				v.m2[index] = value
+			}
+			// make sure that the knowlege about the arguments adds up
+			for i, rvid := range r.series[index].args {
+				if id, ok := v.m[args[i]]; ok {
+					if id != rvid {
+						continue
+					}
+				} else if rvid != -1 {
+					v.m[args[i]] = rvid
+					v.m2[rvid] = args[i]
+				}
+			}
+			if len(r.series)-1 == index {
+				found = append(found, v)
+			} else {
+				out = append(out, v)
+			}
+		}
+	}
+	return out, found
+}
+
+// func matchRuleFact(searchspace []ruleset, i1, i2 *Value) []ruleset {
+// 	//TODO: Is allocating to expensive?
+// 	out := make([]ruleset, 0, len(searchspace))
+// 	for i, v := range searchspace {
+// 		r := v.r
+// 		var matches1 bool
+// 		var matches2 bool
+// 		switch i1.Op {
+// 		case OpConst8, OpConst16, OpConst32, OpConst64:
+// 			if r.series[r.fact.v1-1].Op == _opConst || r.series[r.fact.v1-1].Op == _opAny {
+// 				matches1 = true
+// 			} else if r.series[r.fact.v2-1].Op == _opConst || r.series[r.fact.v2-1].Op == _opAny {
+// 				matches2 = true
+// 			} else {
+// 				continue
+// 			}
+// 		}
+// 		switch i2.Op {
+// 		case OpConst8, OpConst16, OpConst32, OpConst64:
+// 			if !matches1 && (r.series[r.fact.v1-1].Op == _opConst || r.series[r.fact.v1-1].Op == _opAny) {
+// 				searchspace[i].found = true
+// 			} else if !matches2 && (r.series[r.fact.v2-1].Op == _opConst || r.series[r.fact.v2-1].Op == _opAny) {
+// 				out = append(out, v)
+// 			} else {
+// 				continue
+// 			}
+// 		}
+// 	}
+// 	return out
+// }
+
 // add facts that relate to the resulting branch
 // direct only adds facts that are directly related, so only go one deep).
 func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 	// Doesnt handle any other block kinds
-	if b.ID == 3 && b.Kind == BlockIf {
+	if b.Kind == BlockIf {
 		tmpValues := b.ControlValues()
 		var values = make([]*Value, len(tmpValues), len(tmpValues))
 
 		for i, v := range tmpValues {
 			values[i] = v
 		}
-
+		var found []ruleset
+		var matches []ruleset = make([]ruleset, len(rules))
+		for i, v := range rules {
+			matches[i] = ruleset{
+				r:              v,
+				m:              make(map[*Value]int),
+				m2:             make(map[int]*Value),
+				relationProven: false,
+			}
+		}
+		index := 0
 		for len(values) != 0 {
 			value := values[len(values)-1]
 			values = values[:len(values)-1]
 
 			switch value.Op {
-			case OpLeq32:
-				// If we compare against a constant
-				// Currently only 0 is considered
-				if len(value.Args) != 0 && value.Args[0].Op == OpConst32 && value.Args[0].AuxInt == 0 {
-					values = append(values, value.Args[1])
-				}
-			case OpNeg32:
-				var zix uint32
-				var ok bool
-				if zix, ok = ft.orderS.constants[0]; !ok {
-					continue
-				}
+			case OpLeq8, OpLeq16, OpLeq32, OpLeq64:
+				matches, found = matchRule(matches, _opLeq, index, value, value.Args)
+				index++
+				values = append(values, value.Args[0], value.Args[1])
+			case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
+				matches, found = matchRule(matches, _opNeg, index, value, value.Args)
+				index++
+				values = append(values, value.Args[0])
+			case OpConst8, OpConst16, OpConst32, OpConst64:
+				matches, found = matchRule(matches, _opConst, index, value, value.Args)
+				index++
+			default:
+				matches, found = matchRule(matches, _opAny, index, value, value.Args)
+				index++
+				// case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
+				// 	matches, found = matchRule(matches, _opNeg, index, value, value.Args)
+				// 	index++
+				// var zix uint32
+				// var ok bool
+				// if zix, ok = ft.orderS.constants[0]; !ok {
+				// 	continue
+				// }
+				// order := ft.orderS
+				// vix, found := order.lookup(value.Args[0])
+				// if !found {
+				// 	continue
+				// }
+				// //TODO: It would be nice if there was a reaches that returned the strictness so we could adjust as well
+				// if order.reaches(zix, vix, false) {
+				// 	var zeroValue *Value
+				// 	//TODO: This should be done cleaner
+				// 	for zid, ix := range order.values {
+				// 		if ix == zix {
+				// 			zeroValue = &Value{ID: zid}
+				// 		}
+				// 	}
+				// 	order.SetOrderOrEqual(value, zeroValue)
+				// }
+				// if order.reaches(vix, zix, false) {
+				// 	var zeroValue *Value
+				// 	//TODO: This should be done cleaner
+				// 	for zid, ix := range order.values {
+				// 		if ix == zix {
+				// 			zeroValue = &Value{ID: zid}
+				// 		}
+				// 	}
+				// 	order.SetOrderOrEqual(zeroValue, value)
+				// }
+			}
+
+			for _, rs := range found {
+				var assv1 *Value = rs.m2[rs.r.fact.v1]
+				var assv2 *Value = rs.m2[rs.r.fact.v2]
+				var conv1 *Value = rs.m2[rs.r.conclusion.v1]
+				var conv2 *Value = rs.m2[rs.r.conclusion.v2]
+
 				order := ft.orderS
-				vix, found := order.lookup(value.Args[0])
+
+				v1ix, found := order.lookup(assv1)
 				if !found {
 					continue
 				}
-				//TODO: It would be nice if there was a reaches that returned the strictness so we could adjust as well
-				if order.reaches(zix, vix, false) {
-					var zeroValue *Value
-					//TODO: This should be done cleaner
-					for zid, ix := range order.values {
-						if ix == zix {
-							zeroValue = &Value{ID: zid}
-						}
-					}
-					order.SetOrderOrEqual(value, zeroValue)
+				v2ix, found := order.lookup(assv2)
+				if !found {
+					continue
 				}
-				if order.reaches(vix, zix, false) {
-					var zeroValue *Value
-					//TODO: This should be done cleaner
-					for zid, ix := range order.values {
-						if ix == zix {
-							zeroValue = &Value{ID: zid}
-						}
+
+				strictness := false
+				if rs.r.fact.strict != nil {
+					strictness = *rs.r.fact.strict
+				}
+				//TODO: It would be nice if there was a reaches that returned the strictness so we could adjust as well
+				if order.reaches(v1ix, v2ix, false) {
+					if rs.r.conclusion.strict != nil && *rs.r.conclusion.strict {
+						order.SetOrder(conv1, conv2)
+					} else if rs.r.conclusion.strict == nil && strictness {
+						order.SetOrder(conv1, conv2)
+					} else {
+						order.SetOrderOrEqual(conv1, conv2)
 					}
-					order.SetOrderOrEqual(zeroValue, value)
+				}
+				if order.reaches(v2ix, v1ix, false) {
+					if rs.r.conclusion.strict != nil && *rs.r.conclusion.strict {
+						order.SetOrder(conv2, conv1)
+					} else if rs.r.conclusion.strict == nil && strictness {
+						order.SetOrder(conv2, conv1)
+					} else {
+						order.SetOrderOrEqual(conv2, conv1)
+					}
 				}
 			}
+
 		}
 	}
 }
