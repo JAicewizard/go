@@ -357,6 +357,25 @@ func (po *poset) newconst(n *Value) {
 		}
 	}
 
+	//TODO: Should we go more than one layer deep? that may be expensive.
+	if c, found := po.constants[val+1]; found {
+		for ni, _ := range po.nodes {
+			l, r := po.children(uint32(ni))
+			if l == posetEdge(c<<1)+1 || r == posetEdge(c<<1)+1 {
+				po.addchild(uint32(ni), i, false)
+			}
+		}
+	}
+	if c, found := po.constants[val-1]; found {
+		l, r := po.children(c)
+		if l&1 == 1 {
+			po.addchild(i, uint32(l>>1), false)
+		}
+		if r&1 == 1 {
+			po.addchild(i, uint32(r>>1), false)
+		}
+	}
+
 	if lowerptr == 0 && higherptr == 0 {
 		// This should not happen, as at least one
 		// other constant must exist if we get here.

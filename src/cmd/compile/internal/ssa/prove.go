@@ -529,6 +529,80 @@ func (ft *factsTable) update(parent *Block, v, w *Value, d domain, r relation) {
 					}
 				}
 			}
+		} else if x, delta := isConstDelta(w); x != nil && d == signed {
+			if parent.Func.pass.debug > 1 {
+				parent.Func.Warnl(parent.Pos, "x+d %s v; x:%v %v delta:%v w:%v d:%v", r, x, parent.String(), delta, w.AuxInt, d)
+			}
+			if !v.isGenericIntConst() {
+				// If we know that v > x+delta but v is not constant, we can derive:
+				//    if delta < 0 and x > MinInt - delta, then v > x (because x+delta cannot underflow)
+				// This is useful for loops with bounds "len(slice)-K" (delta = -K)
+				// if l, has := ft.limits[x.ID]; has && delta < 0 {
+				// 	if (x.Type.Size() == 8 && l.min >= math.MinInt64-delta) ||
+				// 		(x.Type.Size() == 4 && l.min >= math.MinInt32-delta) {
+				// 		ft.update(parent, v, x, signed, r|eq)
+				// 	}
+				// }
+			} else {
+				// With v,delta constants, we want to derive: v > x+delta  ⇒  v-delta > x
+				//
+				// We compute (using integers of the correct size):
+				//    min = MaxInt - delta
+				//    max = v - delta
+				//
+				// And we prove that:
+				//    if min<max: min <= x AND x < max
+				//    if min>max: min <= x OR  x < max
+				//
+				// This is always correct, even in case of overflow.
+				//
+				// If the initial fact is x+delta >= v instead, the derived conditions are:
+				//    if min<max: min <= x AND x <= max
+				//    if min>max: min <= x OR  x <= max
+				//
+				// Notice the conditions for max are still <=, as they handle overflows.
+				var min, max int64
+				var vmin, vmax *Value
+				switch x.Type.Size() {
+				case 8:
+					min = int64(^uint64(0)>>1) - delta
+					max = v.AuxInt - delta
+
+					vmin = parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, min)
+					vmax = parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, max)
+
+				case 4:
+					min = int64(int32(^uint32(0)>>1) - int32(delta))
+					max = int64(int32(v.AuxInt) - int32(delta))
+
+					vmin = parent.NewValue0I(parent.Pos, OpConst32, parent.Func.Config.Types.Int32, min)
+					vmax = parent.NewValue0I(parent.Pos, OpConst32, parent.Func.Config.Types.Int32, max)
+
+				default:
+					panic("unimplemented")
+				}
+
+				if min < max {
+					// Record that x >= min and max > x
+					ft.update(parent, x, vmin, d, r|eq)
+					ft.update(parent, vmax, x, d, r)
+				} else {
+					// We know that either x>min OR x<=max. factsTable cannot record OR conditions,
+					// so let's see if we can already prove that one of them is false, in which case
+					// the other must be true
+					// if l, has := ft.limits[x.ID]; has {
+					// 	if l.max <= min {
+					// 		if r&eq == 0 || l.max < min {
+					// 			// x>min (x>=min) is impossible, so it must be x<=max
+					// 			ft.update(parent, vmax, x, d, r)
+					// 		}
+					// 	} else if l.min > max {
+					// 		// x<=max is impossible, so it must be x>min
+					// 		ft.update(parent, x, vmin, d, r|eq)
+					// 	}
+					// }
+				}
+			}
 		}
 	}
 
@@ -900,7 +974,7 @@ func prove(f *Func) {
 
 			if branch != unknown {
 				addBranchRestrictions(ft, parent, branch)
-				addBranchingFacts(ft, node.block, false)
+				addBranchingFacts(ft, node.block, parent, false)
 				if ft.unsat {
 					// node.block is unreachable.
 					// Remove it and don't visit
@@ -951,6 +1025,7 @@ const (
 	_opLeq
 	_opLe
 	_opAdd
+	_opSub
 )
 
 type rulevalue struct {
@@ -960,13 +1035,22 @@ type rulevalue struct {
 	followpath []bool
 }
 
+type constexpr struct {
+	Op   genericOp
+	args []constexpr
+	cnst int64
+	ID   int
+}
+
 // A relation between 2 values in the rule.
 // Strictness is defined by the strict field. If the strict
 // field is nil, strictness should be figured out.
 type rulerelation struct {
-	v1     int
-	v2     int
-	strict *bool
+	v1          int
+	v1rulevalue *constexpr
+	v2          int
+	v2rulevalue *constexpr
+	strict      *bool
 }
 
 type rule struct {
@@ -979,6 +1063,7 @@ type rule struct {
 	// These 2 values have the same relation as the fact field
 	conclusion rulerelation
 	assumeSame bool
+	check      func(map[int]*Value, *Block) bool
 }
 
 var _true = true
@@ -1019,9 +1104,12 @@ var rules []rule = []rule{
 			},
 		},
 		fact: rulerelation{
-			v1:     5,
+			v1rulevalue: &constexpr{
+				Op:   _opSub,
+				args: []constexpr{constexpr{Op: _opConst, ID: 5}, constexpr{Op: _opConst, ID: 3}},
+			},
 			v2:     4,
-			strict: &_true,
+			strict: nil,
 		},
 		conclusion: rulerelation{
 			v1:     1,
@@ -1029,6 +1117,101 @@ var rules []rule = []rule{
 			strict: nil,
 		},
 		assumeSame: false,
+		check: func(values map[int]*Value, parent *Block) bool {
+			// var assv1 *Value = rs.m2[5]
+			// var assv2 *Value = rs.m2[4]
+			// var conv1 *Value = rs.m2[1]
+			// var conv2 *Value = rs.m2[2]
+
+			// check := parent.NewValue0I(parent.Pos, Value.Op, Value.Type, max)
+
+			// order := ft.orderS
+
+			// v1ix, found := order.lookup(assv1)
+			// if !found {
+			// 	return false
+			// }
+			// v2ix, found := order.lookup(assv2)
+			// if !found {
+			// 	return false
+			// }
+
+			// strictness := false
+			// if rs.r.fact.strict != nil {
+			// 	strictness = *rs.r.fact.strict
+			// }
+			// if order.reaches(v1ix, v2ix, false) {
+			// 	if rs.r.conclusion.strict != nil && *rs.r.conclusion.strict {
+			// 		order.SetOrder(conv1, conv2)
+			// 	} else if rs.r.conclusion.strict == nil && strictness {
+			// 		order.SetOrder(conv1, conv2)
+			// 	} else {
+			// 		order.SetOrderOrEqual(conv1, conv2)
+			// 	}
+			// }
+			// if order.reaches(v2ix, v1ix, false) {
+			// 	if rs.r.conclusion.strict != nil && *rs.r.conclusion.strict {
+			// 		order.SetOrder(conv2, conv1)
+			// 	} else if rs.r.conclusion.strict == nil && strictness {
+			// 		order.SetOrder(conv2, conv1)
+			// 	} else {
+			// 		order.SetOrderOrEqual(conv2, conv1)
+			// 	}
+			// }
+			return false
+		},
+	},
+	rule{
+		series: []rulevalue{
+			rulevalue{
+				ID:         0,
+				Op:         _opLe,
+				args:       []int{1, 5},
+				followpath: []bool{true, true},
+			},
+			rulevalue{
+				ID:         1,
+				Op:         _opNeg,
+				args:       []int{2},
+				followpath: []bool{true},
+			},
+			rulevalue{
+				ID:         2,
+				Op:         _opAdd,
+				args:       []int{4, 3},
+				followpath: []bool{true, true},
+			},
+			//TODO: This rule relies on knowing that the constant is non-0
+			rulevalue{
+				ID: 3,
+				Op: _opConst,
+			},
+			rulevalue{
+				ID: 4,
+				Op: _opAny,
+			},
+			rulevalue{
+				ID: 5,
+				Op: _opConst,
+			},
+		},
+		fact: rulerelation{
+			v1rulevalue: &constexpr{
+				Op:   _opSub,
+				args: []constexpr{constexpr{Op: _opNeg, args: []constexpr{constexpr{Op: _opConst, ID: 5}}}, constexpr{Op: _opConst, ID: 3}},
+			},
+			v2:     4,
+			strict: nil,
+		},
+		conclusion: rulerelation{
+			v1:     1,
+			v2:     5,
+			strict: nil,
+		},
+		assumeSame: false,
+		check: func(values map[int]*Value, parent *Block) bool {
+			return false
+		},
 	},
 }
 
@@ -1040,21 +1223,45 @@ type ruleset struct {
 	visited        int
 }
 
-func matchRule(searchspace []ruleset, opkind genericOp, value *Value, args []*Value, first bool) ([]ruleset, []ruleset) {
+func (expr constexpr) eval(m2 map[int]*Value, parent *Block) *Value {
+	switch expr.Op {
+	case _opConst:
+		a := m2[expr.ID]
+		return parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, a.AuxInt)
+	case _opAdd:
+		a := expr.args[0].eval(m2, parent)
+		b := expr.args[1].eval(m2, parent)
+		return parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, a.AuxInt+b.AuxInt)
+	case _opSub:
+		a := expr.args[0].eval(m2, parent)
+		b := expr.args[1].eval(m2, parent)
+		return parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, a.AuxInt-b.AuxInt)
+	case _opNeg:
+		a := expr.args[0].eval(m2, parent)
+		return parent.NewValue0I(parent.Pos, OpConst64, parent.Func.Config.Types.Int64, -a.AuxInt)
+	}
+	return nil
+}
+
+func matchRule(searchspace, undecided []ruleset, opkind genericOp, value *Value, args []*Value) ([]ruleset, []ruleset, []ruleset) {
 	//TODO: Is allocating to expensive?
 	out := make([]ruleset, 0, len(searchspace))
 	found := make([]ruleset, 0)
-	for _, v := range searchspace {
+	for i, v := range append(searchspace, undecided...) {
 		r := v.r
+
+		var first bool = i >= len(searchspace)
 		var index int
 		if first {
 			index = 0
 		} else if vid, ok := v.m[value]; ok {
 			index = vid
 		} else {
-			return nil, nil
+			continue
 		}
 		if r.series[index].Op == opkind {
+			//TODO: dont double map lookup?
+
 			// make sure that the knowlege about the assigned value adds up
 			if id, ok := v.m[value]; ok {
 				if id != index {
@@ -1119,12 +1326,12 @@ func matchRule(searchspace []ruleset, opkind genericOp, value *Value, args []*Va
 			}
 		}
 	}
-	return out, found
+	return out, found, undecided
 }
 
 // add facts that relate to the resulting branch
 // direct only adds facts that are directly related, so only go one deep).
-func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
+func addBranchingFacts(ft *factsTable, b, parent *Block, direct bool) {
 	// Doesnt handle any other block kinds
 	if b.Kind == BlockIf {
 		tmpValues := b.ControlValues()
@@ -1134,9 +1341,10 @@ func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 			values[i] = v
 		}
 		var found []ruleset
-		var matches []ruleset = make([]ruleset, len(rules))
+		var undecided []ruleset = make([]ruleset, len(rules))
+		var matches []ruleset
 		for i, v := range rules {
-			matches[i] = ruleset{
+			undecided[i] = ruleset{
 				r:              v,
 				m:              make(map[*Value]int),
 				m2:             make(map[int]*Value),
@@ -1150,65 +1358,34 @@ func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 
 			switch value.Op {
 			case OpLeq8, OpLeq16, OpLeq32, OpLeq64:
-				matches, found = matchRule(matches, _opLeq, value, value.Args, true)
+				matches, found, undecided = matchRule(matches, undecided, _opLeq, value, value.Args)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpLess8, OpLess16, OpLess32, OpLess64:
-				matches, found = matchRule(matches, _opLe, value, value.Args, false)
+				matches, found, undecided = matchRule(matches, undecided, _opLe, value, value.Args)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
-				matches, found = matchRule(matches, _opNeg, value, value.Args, false)
+				matches, found, undecided = matchRule(matches, undecided, _opNeg, value, value.Args)
 				index++
 				values = append(values, value.Args[0])
 			case OpAdd8, OpAdd16, OpAdd32, OpAdd64:
-				matches, found = matchRule(matches, _opAdd, value, value.Args, false)
+				matches, found, undecided = matchRule(matches, undecided, _opAdd, value, value.Args)
 				index++
 				values = append(values, value.Args[0], value.Args[1])
 			case OpConst8, OpConst16, OpConst32, OpConst64:
-				matches, found = matchRule(matches, _opConst, value, value.Args, false)
+				matches, found, undecided = matchRule(matches, undecided, _opConst, value, value.Args)
 				index++
 			default:
-				matches, found = matchRule(matches, _opAny, value, value.Args, false)
+				matches, found, undecided = matchRule(matches, undecided, _opAny, value, value.Args)
 				index++
-				// case OpNeg8, OpNeg16, OpNeg32, OpNeg64:
-				// 	matches, found = matchRule(matches, _opNeg, index, value, value.Args)
-				// 	index++
-				// var zix uint32
-				// var ok bool
-				// if zix, ok = ft.orderS.constants[0]; !ok {
-				// 	continue
-				// }
-				// order := ft.orderS
-				// vix, found := order.lookup(value.Args[0])
-				// if !found {
-				// 	continue
-				// }
-				// //TODO: It would be nice if there was a reaches that returned the strictness so we could adjust as well
-				// if order.reaches(zix, vix, false) {
-				// 	var zeroValue *Value
-				// 	//TODO: This should be done cleaner
-				// 	for zid, ix := range order.values {
-				// 		if ix == zix {
-				// 			zeroValue = &Value{ID: zid}
-				// 		}
-				// 	}
-				// 	order.SetOrderOrEqual(value, zeroValue)
-				// }
-				// if order.reaches(vix, zix, false) {
-				// 	var zeroValue *Value
-				// 	//TODO: This should be done cleaner
-				// 	for zid, ix := range order.values {
-				// 		if ix == zix {
-				// 			zeroValue = &Value{ID: zid}
-				// 		}
-				// 	}
-				// 	order.SetOrderOrEqual(zeroValue, value)
-				// }
 			}
 
 			for _, rs := range found {
 				var assv1 *Value = rs.m2[rs.r.fact.v1]
+				if rs.r.fact.v1rulevalue != nil {
+					assv1 = rs.r.fact.v1rulevalue.eval(rs.m2, parent)
+				}
 				var assv2 *Value = rs.m2[rs.r.fact.v2]
 				var conv1 *Value = rs.m2[rs.r.conclusion.v1]
 				var conv2 *Value = rs.m2[rs.r.conclusion.v2]
@@ -1248,7 +1425,6 @@ func addBranchingFacts(ft *factsTable, b *Block, direct bool) {
 					}
 				}
 			}
-
 		}
 	}
 }

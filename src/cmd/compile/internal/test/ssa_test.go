@@ -5,21 +5,23 @@
 package test
 
 import (
-	"bytes"
-	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"internal/testenv"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strings"
+	// "bytes"
+	// "fmt"
+	// "go/ast"
+	// "go/parser"
+	// "go/token"
+	// "internal/testenv"
+	// "io/ioutil"
+	// "os"
+	// "os/exec"
+	// "path/filepath"
+	// "runtime"
+	// "strings"
+	"math"
 	"testing"
 )
 
+/*
 // runGenTest runs a test-generator, then runs the generated test.
 // Generated test can either fail in compilation or execution.
 // The environment variable parameter(s) is passed to the run
@@ -188,4 +190,69 @@ func TestCode(t *testing.T) {
 			})
 		}
 	}
+}
+*/
+var t_NegShift_glob_1 = -1
+var t_NegShift_glob_2 = math.MinInt
+var t_NegShift_glob_3 = 0
+var t_NegShift_glob_4 = -2
+var t_NegShift_glob_5 = 1
+var t_NegShift_glob_6 = 1
+
+func TestNegShift(t *testing.T) {
+	// The goal of these tests are to try and get the prove SSA to remove a branch it shouldnt remove
+	/*if t_NegShift_glob_1 < 0 {
+		x := t_NegShift_glob_1 + 1
+		if -x < 0 {
+			t.Log("unsound optimisation")
+			t.Fail()
+		}
+		_ = 43 << -x
+	}
+
+	if t_NegShift_glob_2 < 0 {
+		x := t_NegShift_glob_2 + 1
+		if -x < 0 {
+			t.Log("unsound optimisation")
+			t.Fail()
+		}
+	}
+	// The compiler cant prove this yet, since the poset isnt complete.
+	// It doesnt fully keep track of relations with constants.
+	// off-by-one constants where one has a strict relation op/down, n+1/n-1
+	// respectively also have a non-strict relation with those.
+	if t_NegShift_glob_3 < 1 {
+		x := t_NegShift_glob_3 + 1
+		if -x < -1 {
+			t.Log("unsound optimisation")
+			t.Fail()
+		}
+	}
+	// The compiler cant actually catch this case yet.
+	// Because we do + 1 in the first comparison, it doesnt store any
+	// information about the variable (it could have overflown). Then because it didnt store any,
+	// it also doesnt know that + 2 will always be one bigger.
+	if t_NegShift_glob_4+1 < 0 {
+		x := t_NegShift_glob_4 + 2
+		if -x < 0 {
+			t.Log("unsound optimisation")
+			t.Fail()
+		}
+	}
+	// The compiler cant catch this case either, since it
+	// doesnt match the pattern.
+	if t_NegShift_glob_5-1 < 0 {
+		x := t_NegShift_glob_5
+		if -x < 0 {
+			t.Log("unsound optimisation")
+			t.Fail()
+		}
+	} */
+	// if t_NegShift_glob_6-31 < 0 {
+	// 	x := t_NegShift_glob_6 - 30
+	// 	if -x < 0 {
+	// 		t.Log("unsound optimisation")
+	// 		t.Fail()
+	// 	}
+	// }
 }

@@ -123,7 +123,7 @@ import "testing"
 // 	}
 // }
 
-var glob_1 = -1
+var glob_1 = 7
 
 //go:noinline
 func addloop(b *testing.B) int {
@@ -133,7 +133,7 @@ func addloop(b *testing.B) int {
 			glob_1 += 1
 			out += 1 << -glob_1
 		}
-		glob_1 *= 2
+		glob_1 *= glob_1
 	}
 	return out
 }
