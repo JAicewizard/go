@@ -45,8 +45,14 @@ func (notExistError) Is(err error) bool { return err == fs.ErrNotExist }
 
 const gitWorkDirType = "git3"
 
-func newGitRepo(ctx context.Context, remote string, local bool) (Repo, error) {
-	r := &gitRepo{remote: remote, local: local}
+func newGitRepo(ctx context.Context, remote string, local, lfs bool) (Repo, error) {
+	r := &gitRepo{remote: remote, local: local, lfs: lfs}
+	if lfs {
+		_, err := r.runGit(ctx, "git", "lfs", "--version")
+		if err != nil {
+			return nil, fmt.Errorf("trying to clone package with lfs, but unable to use lfs ('git lfs --version' returned an error)")
+		}
+	}
 	if local {
 		if strings.Contains(remote, "://") { // Local flag, but URL provided
 			return nil, fmt.Errorf("git remote (%s) lookup disabled", remote)
@@ -148,6 +154,9 @@ type gitRepo struct {
 	remote, remoteURL string
 	local             bool // local only lookups; no remote fetches
 	dir               string
+
+	// This module uses git LFS. If false, lfs must be forced off
+	lfs bool
 
 	// Repo uses the SHA256 for hashes, so expect the hashes to be 256/4 == 64-bytes in hex.
 	sha256Hashes bool
@@ -737,6 +746,13 @@ func (r *gitRepo) ReadFile(ctx context.Context, rev, file string, maxSize int64)
 	if err != nil {
 		return nil, fs.ErrNotExist
 	}
+	if r.lfs {
+		out, err = r.runGitStdin(ctx, bytes.NewBuffer(out), "git", "lfs", "smudge")
+		if err != nil {
+			return nil, fs.ErrNotExist
+		}
+	}
+
 	return out, nil
 }
 
@@ -983,6 +999,23 @@ func (r *gitRepo) runGit(ctx context.Context, cmdline ...any) ([]byte, error) {
 		// This is necessary only for remote repositories as they are initialized with git init --bare.
 		args.env = []string{"GIT_DIR=" + r.dir}
 	}
+	if !r.lfs {
+		args.env = append(args.env, "GIT_LFS_SKIP_SMUDGE=1")
+	}
+	return RunWithArgs(ctx, args)
+}
+
+func (r *gitRepo) runGitStdin(ctx context.Context, stdin io.Reader, cmdline ...any) ([]byte, error) {
+	args := RunArgs{cmdline: cmdline, dir: r.dir, local: r.local}
+	if !r.local {
+		// Manually supply GIT_DIR so Git works with safe.bareRepository=explicit set.
+		// This is necessary only for remote repositories as they are initialized with git init --bare.
+		args.env = []string{"GIT_DIR=" + r.dir}
+	}
+	if !r.lfs {
+		args.env = append(args.env, "GIT_LFS_SKIP_SMUDGE=1")
+	}
+	args.stdin = stdin
 	return RunWithArgs(ctx, args)
 }
 

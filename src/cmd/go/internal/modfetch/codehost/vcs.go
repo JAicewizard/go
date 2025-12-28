@@ -95,7 +95,10 @@ type vcsRepo struct {
 
 func newVCSRepo(ctx context.Context, vcs, remote string, local bool) (Repo, error) {
 	if vcs == "git" {
-		return newGitRepo(ctx, remote, local)
+		return newGitRepo(ctx, remote, local, false)
+	}
+	if vcs == "git-lfs" {
+		return newGitRepo(ctx, remote, local, true)
 	}
 	r := &vcsRepo{remote: remote, local: local}
 	cmd := vcsCmds[vcs]

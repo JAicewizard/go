@@ -321,7 +321,7 @@ func lookupDirect(ctx context.Context, path string) (Repo, error) {
 }
 
 func lookupCodeRepo(ctx context.Context, rr *vcs.RepoRoot, local bool) (codehost.Repo, error) {
-	code, err := codehost.NewRepo(ctx, rr.VCS.Cmd, rr.Repo, local)
+	code, err := codehost.NewRepo(ctx, rr.VCS.Qualifier, rr.Repo, local)
 	if err != nil {
 		if _, ok := err.(*codehost.VCSError); ok {
 			return nil, err

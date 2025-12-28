@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,13 +36,16 @@ import (
 // A Cmd describes how to use a version control system
 // like Mercurial, Git, or Subversion.
 type Cmd struct {
-	Name  string
-	Cmd   string      // name of binary to invoke command
-	Env   []string    // any environment values to set/override
-	Roots []isVCSRoot // filters to identify repository root directories
+	Name      string
+	Qualifier string      // ID of vsc. Usually the same as command, but should be seen as shortname
+	Cmd       string      // name of binary to invoke command
+	Env       []string    // any environment values to set/override
+	Roots     []isVCSRoot // filters to identify repository root directories
 
 	Scheme  []string
 	PingCmd string
+
+	CanNest []string // Qualifiers of of VSCs that can nest inside this vsc
 
 	Status func(v *Cmd, rootDir string) (Status, error)
 }
@@ -119,6 +123,7 @@ type tagCmd struct {
 // vcsList lists the known version control systems
 var vcsList = []*Cmd{
 	vcsHg,
+	vcsGitLfs,
 	vcsGit,
 	vcsSvn,
 	vcsFossil,
@@ -128,11 +133,11 @@ var vcsList = []*Cmd{
 // repoRootForImportDynamic, but is otherwise not treated as a VCS command.
 var vcsMod = &Cmd{Name: "mod"}
 
-// vcsByCmd returns the version control system for the given
-// command name (hg, git, svn).
-func vcsByCmd(cmd string) *Cmd {
+// vcsByQualifier returns the version control system for the given
+// short name (hg, git, svn).
+func vcsByQualifier(q string) *Cmd {
 	for _, vcs := range vcsList {
-		if vcs.Cmd == cmd {
+		if vcs.Qualifier == q {
 			return vcs
 		}
 	}
@@ -141,8 +146,9 @@ func vcsByCmd(cmd string) *Cmd {
 
 // vcsHg describes how to use Mercurial.
 var vcsHg = &Cmd{
-	Name: "Mercurial",
-	Cmd:  "hg",
+	Name:      "Mercurial",
+	Qualifier: "hg",
+	Cmd:       "hg",
 
 	// HGPLAIN=+strictflags turns off additional output that a user may have
 	// enabled via config options or certain extensions.
@@ -208,23 +214,93 @@ func parseRevTime(out []byte) (string, time.Time, error) {
 	return rev, time.Unix(secs, 0), nil
 }
 
-// vcsGit describes how to use Git.
-var vcsGit = &Cmd{
-	Name: "Git",
-	Cmd:  "git",
-	Roots: []isVCSRoot{
-		vcsGitRoot{},
-	},
+// vcsGit describes how to use Git _without_ LFS.
+var vcsGit = newGitVcs(false)
 
-	Scheme: []string{"git", "https", "http", "git+ssh", "ssh"},
+// vcsGitLfs describes how to use Git _with_ LFS.
+var vcsGitLfs = newGitVcs(true)
 
-	// Leave out the '--' separator in the ls-remote command: git 2.7.4 does not
-	// support such a separator for that command, and this use should be safe
-	// without it because the {scheme} value comes from the predefined list above.
-	// See golang.org/issue/33836.
-	PingCmd: "ls-remote {scheme}://{repo}",
+func newGitVcs(lfs bool) *Cmd {
+	cmd := &Cmd{
+		Name: "Git",
+		Cmd:  "git",
+		Roots: []isVCSRoot{
+			vcsGitRoot{},
+		},
 
-	Status: gitStatus,
+		Scheme: []string{"git", "https", "http", "git+ssh", "ssh"},
+
+		// Leave out the '--' separator in the ls-remote command: git 2.7.4 does not
+		// support such a separator for that command, and this use should be safe
+		// without it because the {scheme} value comes from the predefined list above.
+		// See golang.org/issue/33836.
+		PingCmd: "ls-remote {scheme}://{repo}",
+
+		// Nested Git is allowed, as this is how things like
+		// submodules work. Git explicitly protects against
+		// injection against itself.
+
+		CanNest: []string{"git", "git-lfs"},
+
+		Status: gitStatus,
+	}
+
+	if !lfs {
+		cmd.Env = append(cmd.Env, "GIT_LFS_SKIP_SMUDGE=1")
+		cmd.Qualifier = "Git"
+		cmd.Qualifier = "git"
+	} else {
+		cmd.Qualifier = "Git LFS"
+		cmd.Qualifier = "git-lfs"
+	}
+
+	return cmd
+}
+
+// scpSyntaxRe matches the SCP-like addresses used by Git to access
+// repositories by SSH.
+var scpSyntaxRe = lazyregexp.New(`^(\w+)@([\w.-]+):(.*)$`)
+
+func gitRemoteRepo(vcsGit *Cmd, rootDir string) (remoteRepo string, err error) {
+	const cmd = "config remote.origin.url"
+	outb, err := vcsGit.run1(rootDir, cmd, nil, false)
+	if err != nil {
+		// if it doesn't output any message, it means the config argument is correct,
+		// but the config value itself doesn't exist
+		if outb != nil && len(outb) == 0 {
+			return "", errors.New("remote origin not found")
+		}
+		return "", err
+	}
+	out := strings.TrimSpace(string(outb))
+
+	var repoURL *urlpkg.URL
+	if m := scpSyntaxRe.FindStringSubmatch(out); m != nil {
+		// Match SCP-like syntax and convert it to a URL.
+		// Eg, "git@github.com:user/repo" becomes
+		// "ssh://git@github.com/user/repo".
+		repoURL = &urlpkg.URL{
+			Scheme: "ssh",
+			User:   urlpkg.User(m[1]),
+			Host:   m[2],
+			Path:   m[3],
+		}
+	} else {
+		repoURL, err = urlpkg.Parse(out)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Iterate over insecure schemes too, because this function simply
+	// reports the state of the repo. If we can't see insecure schemes then
+	// we can't report the actual repo URL.
+	for _, s := range vcsGit.Scheme {
+		if repoURL.Scheme == s {
+			return repoURL.String(), nil
+		}
+	}
+	return "", errors.New("unable to parse output of git " + cmd)
 }
 
 func gitStatus(vcsGit *Cmd, rootDir string) (Status, error) {
@@ -258,8 +334,9 @@ func gitStatus(vcsGit *Cmd, rootDir string) (Status, error) {
 
 // vcsSvn describes how to use Subversion.
 var vcsSvn = &Cmd{
-	Name: "Subversion",
-	Cmd:  "svn",
+	Name:      "Subversion",
+	Qualifier: "svn",
+	Cmd:       "svn",
 	Roots: []isVCSRoot{
 		vcsDirRoot(".svn"),
 	},
@@ -307,8 +384,9 @@ const fossilRepoName = ".fossil"
 
 // vcsFossil describes how to use Fossil (fossil-scm.org)
 var vcsFossil = &Cmd{
-	Name: "Fossil",
-	Cmd:  "fossil",
+	Name:      "Fossil",
+	Qualifier: "fossil",
+	Cmd:       "fossil",
 	Roots: []isVCSRoot{
 		vcsFileRoot(".fslckout"),
 		vcsFileRoot("_FOSSIL_"),
@@ -474,7 +552,7 @@ type vcsPath struct {
 	pathPrefix     string                              // prefix this description applies to
 	regexp         *lazyregexp.Regexp                  // compiled pattern for import path
 	repo           string                              // repository to use (expand with match of re)
-	vcs            string                              // version control system to use (expand with match of re)
+	vcs            string                              // ID of the version control system to use (expand with match of re)
 	check          func(match map[string]string) error // additional checks
 	schemelessRepo bool                                // if true, the repo pattern lacks a scheme
 }
@@ -513,13 +591,10 @@ func FromDir(dir, srcRoot string) (repoDir string, vcsCmd *Cmd, err error) {
 					// attacks.
 					continue
 				}
-				if vcsCmd == vcsGit && vcs == vcsGit {
-					// Nested Git is allowed, as this is how things like
-					// submodules work. Git explicitly protects against
-					// injection against itself.
+				if slices.Contains(vcsCmd.CanNest, vcs.Qualifier) {
 					continue
 				}
-				return "", nil, fmt.Errorf("multiple VCS detected: %s in %q, and %s in %q",
+				return "", nil, fmt.Errorf("incompatible VCS detected: %s in %q, and %s in %q",
 					vcsCmd.Cmd, repoDir, vcs.Cmd, dir)
 			}
 		}
@@ -866,7 +941,7 @@ func repoRootFromVCSPaths(importPath string, security web.SecurityMode, vcsPaths
 				return nil, err
 			}
 		}
-		vcs := vcsByCmd(match["vcs"])
+		vcs := vcsByQualifier(match["vcs"])
 		if vcs == nil {
 			return nil, fmt.Errorf("unknown version control system %q", match["vcs"])
 		}
@@ -1057,7 +1132,7 @@ func repoRootForImportDynamic(importPath string, mod ModuleMode, security web.Se
 	if mmi.VCS == "mod" {
 		vcs = vcsMod
 	} else {
-		vcs = vcsByCmd(mmi.VCS)
+		vcs = vcsByQualifier(mmi.VCS)
 		if vcs == nil {
 			return nil, fmt.Errorf("%s: unknown vcs %q", resp.URL, mmi.VCS)
 		}
@@ -1302,7 +1377,7 @@ var vcsPaths = []*vcsPath{
 	// General syntax for any server.
 	// Must be last.
 	{
-		regexp:         lazyregexp.New(`(?P<root>(?P<repo>([a-z0-9.\-]+\.)+[a-z0-9.\-]+(:[0-9]+)?(/~?[\w.\-]+)+?)\.(?P<vcs>fossil|git|hg|svn))(/~?[\w.\-]+)*$`),
+		regexp:         lazyregexp.New(`(?P<root>(?P<repo>([a-z0-9.\-]+\.)+[a-z0-9.\-]+(:[0-9]+)?(/~?[\w.\-]+)+?)\.(?P<vcs>fossil|git|hg|svn|git-lfs))(/~?[\w.\-]+)*$`),
 		schemelessRepo: true,
 	},
 }
